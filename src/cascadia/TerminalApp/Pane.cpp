@@ -14,7 +14,7 @@ using namespace winrt::Windows::UI::Xaml;
 using namespace winrt::Windows::UI::Core;
 using namespace winrt::Windows::UI::Xaml::Media;
 using namespace winrt::Microsoft::Terminal::Settings::Model;
-using namespace winrt::Microsoft::Terminal::TerminalControl;
+using namespace winrt::Microsoft::Terminal::Control;
 using namespace winrt::Microsoft::Terminal::TerminalConnection;
 using namespace winrt::TerminalApp;
 using namespace TerminalApp;
@@ -312,7 +312,7 @@ bool Pane::NavigateFocus(const FocusDirection& direction)
 // - <none>
 // Return Value:
 // - <none>
-void Pane::_ControlConnectionStateChangedHandler(const TermControl& /*sender*/,
+void Pane::_ControlConnectionStateChangedHandler(const winrt::Windows::Foundation::IInspectable& /*sender*/,
                                                  const winrt::Windows::Foundation::IInspectable& /*args*/)
 {
     std::unique_lock lock{ _createCloseLock };
@@ -329,10 +329,19 @@ void Pane::_ControlConnectionStateChangedHandler(const TermControl& /*sender*/,
     }
 
     const auto newConnectionState = _control.ConnectionState();
+    const auto previousConnectionState = std::exchange(_connectionState, newConnectionState);
 
     if (newConnectionState < ConnectionState::Closed)
     {
         // Pane doesn't care if the connection isn't entering a terminal state.
+        return;
+    }
+
+    if (previousConnectionState < ConnectionState::Connected && newConnectionState >= ConnectionState::Failed)
+    {
+        // A failure to complete the connection (before it has _connected_) is not covered by "closeOnExit".
+        // This is to prevent a misconfiguration (closeOnExit: always, startingDirectory: garbage) resulting
+        // in Terminal flashing open and immediately closed.
         return;
     }
 
@@ -378,8 +387,13 @@ void Pane::_ControlWarningBellHandler(const winrt::Windows::Foundation::IInspect
                 PlaySound(soundAlias, NULL, SND_ALIAS_ID | SND_ASYNC | SND_SENTRY);
             }
 
-            // raise the event with the bool value corresponding to the visual flag
-            _PaneRaiseBellHandlers(nullptr, WI_IsFlagSet(paneProfile.BellStyle(), winrt::Microsoft::Terminal::Settings::Model::BellStyle::Visual));
+            if (WI_IsFlagSet(paneProfile.BellStyle(), winrt::Microsoft::Terminal::Settings::Model::BellStyle::Window))
+            {
+                _control.BellLightOn();
+            }
+
+            // raise the event with the bool value corresponding to the taskbar flag
+            _PaneRaiseBellHandlers(nullptr, WI_IsFlagSet(paneProfile.BellStyle(), winrt::Microsoft::Terminal::Settings::Model::BellStyle::Taskbar));
         }
     }
 }
@@ -597,18 +611,25 @@ void Pane::_FocusFirstChild()
 {
     if (_IsLeaf())
     {
-        if (_root.ActualWidth() == 0 && _root.ActualHeight() == 0)
-        {
-            // When these sizes are 0, then the pane might still be in startup,
-            // and doesn't yet have a real size. In that case, the control.Focus
-            // event won't be handled until _after_ the startup events are all
-            // processed. This will lead to the Tab not being notified that the
-            // focus moved to a different Pane.
-            //
-            // In that scenario, trigger the event manually here, to correctly
-            // inform the Tab that we're now focused.
-            _GotFocusHandlers(shared_from_this());
-        }
+        // Originally, we would only raise a GotFocus event here when:
+        //
+        // if (_root.ActualWidth() == 0 && _root.ActualHeight() == 0)
+        //
+        // When these sizes are 0, then the pane might still be in startup,
+        // and doesn't yet have a real size. In that case, the control.Focus
+        // event won't be handled until _after_ the startup events are all
+        // processed. This will lead to the Tab not being notified that the
+        // focus moved to a different Pane.
+        //
+        // However, with the ability to execute multiple actions at a time, in
+        // already existing windows, we need to always raise this event manually
+        // here, to correctly inform the Tab that we're now focused. This will
+        // take care of commandlines like:
+        //
+        // `wtd -w 0 mf down ; sp`
+        // `wtd -w 0 fp -t 1 ; sp`
+
+        _GotFocusHandlers(shared_from_this());
 
         _control.Focus(FocusState::Programmatic);
     }
@@ -628,7 +649,7 @@ void Pane::_FocusFirstChild()
 // - profile: The GUID of the profile these settings should apply to.
 // Return Value:
 // - <none>
-void Pane::UpdateSettings(const TerminalSettings& settings, const GUID& profile)
+void Pane::UpdateSettings(const TerminalSettingsCreateResult& settings, const GUID& profile)
 {
     if (!_IsLeaf())
     {
@@ -639,7 +660,21 @@ void Pane::UpdateSettings(const TerminalSettings& settings, const GUID& profile)
     {
         if (profile == _profile)
         {
-            _control.UpdateSettings(settings);
+            auto controlSettings = _control.Settings().as<TerminalSettings>();
+            // Update the parent of the control's settings object (and not the object itself) so
+            // that any overrides made by the control don't get affected by the reload
+            controlSettings.SetParent(settings.DefaultSettings());
+            auto unfocusedSettings{ settings.UnfocusedSettings() };
+            if (unfocusedSettings)
+            {
+                // Note: the unfocused settings needs to be entirely unchanged _except_ we need to
+                // set its parent to the settings object that lives in the control. This is because
+                // the overrides made by the control live in that settings object, so we want to make
+                // sure the unfocused settings inherit from that.
+                unfocusedSettings.SetParent(controlSettings);
+            }
+            _control.UnfocusedAppearance(unfocusedSettings);
+            _control.UpdateSettings();
         }
     }
 }
@@ -683,6 +718,7 @@ void Pane::_CloseChild(const bool closeFirst)
 
         // take the control, profile and id of the pane that _wasn't_ closed.
         _control = remainingChild->_control;
+        _connectionState = remainingChild->_connectionState;
         _profile = remainingChild->_profile;
         _id = remainingChild->Id();
 
@@ -875,7 +911,6 @@ winrt::fire_and_forget Pane::_CloseChildRoutine(const bool closeFirst)
         auto removedChild = closeFirst ? _firstChild : _secondChild;
         auto remainingChild = closeFirst ? _secondChild : _firstChild;
         const bool splitWidth = _splitState == SplitState::Vertical;
-        const auto totalSize = splitWidth ? _root.ActualWidth() : _root.ActualHeight();
 
         Size removedOriginalSize{
             ::base::saturated_cast<float>(removedChild->_root.ActualWidth()),
@@ -1450,6 +1485,7 @@ std::pair<std::shared_ptr<Pane>, std::shared_ptr<Pane>> Pane::_Split(SplitState 
     //   Move our control, guid into the first one.
     //   Move the new guid, control into the second.
     _firstChild = std::make_shared<Pane>(_profile.value(), _control);
+    _firstChild->_connectionState = std::exchange(_connectionState, ConnectionState::NotConnected);
     _profile = std::nullopt;
     _control = { nullptr };
     _secondChild = std::make_shared<Pane>(profile, control);
@@ -1550,9 +1586,9 @@ void Pane::Restore(std::shared_ptr<Pane> zoomedPane)
 //   otherwise the ID value will not make sense (leaves have IDs, parents do not)
 // Return Value:
 // - The ID of this pane
-uint16_t Pane::Id() noexcept
+std::optional<uint32_t> Pane::Id() noexcept
 {
-    return _id.value();
+    return _id;
 }
 
 // Method Description:
@@ -1560,7 +1596,7 @@ uint16_t Pane::Id() noexcept
 // - Panes are given IDs upon creation by TerminalTab
 // Arguments:
 // - The number to set this pane's ID to
-void Pane::Id(uint16_t id) noexcept
+void Pane::Id(uint32_t id) noexcept
 {
     _id = id;
 }
@@ -1569,20 +1605,24 @@ void Pane::Id(uint16_t id) noexcept
 // - Recursive function that focuses a pane with the given ID
 // Arguments:
 // - The ID of the pane we want to focus
-void Pane::FocusPane(const uint16_t id)
+bool Pane::FocusPane(const uint32_t id)
 {
     if (_IsLeaf() && id == _id)
     {
-        _control.Focus(FocusState::Programmatic);
+        // Make sure to use _FocusFirstChild here - that'll properly update the
+        // focus if we're in startup.
+        _FocusFirstChild();
+        return true;
     }
     else
     {
         if (_firstChild && _secondChild)
         {
-            _firstChild->FocusPane(id);
-            _secondChild->FocusPane(id);
+            return _firstChild->FocusPane(id) ||
+                   _secondChild->FocusPane(id);
         }
     }
+    return false;
 }
 
 // Method Description:
@@ -2083,6 +2123,13 @@ std::optional<SplitState> Pane::PreCalculateAutoSplit(const std::shared_ptr<Pane
     // We should not possibly be getting here - both the above branches should
     // return a value.
     FAIL_FAST();
+}
+
+// Method Description:
+// - Returns true if the pane or one of its descendants is read-only
+bool Pane::ContainsReadOnly() const
+{
+    return _IsLeaf() ? _control.ReadOnly() : (_firstChild->ContainsReadOnly() || _secondChild->ContainsReadOnly());
 }
 
 DEFINE_EVENT(Pane, GotFocus, _GotFocusHandlers, winrt::delegate<std::shared_ptr<Pane>>);

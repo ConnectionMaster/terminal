@@ -9,6 +9,7 @@
 #include <userenv.h>
 
 #include "ConptyConnection.g.cpp"
+#include "CTerminalHandoff.h"
 
 #include "../../types/inc/utils.hpp"
 #include "../../types/inc/Environment.hpp"
@@ -115,17 +116,23 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
                 // add additional WT env vars like WT_SETTINGS, WT_DEFAULTS and WT_PROFILE_ID
                 for (auto item : _environment)
                 {
-                    auto key = item.Key();
-                    auto value = item.Value();
-
-                    // avoid clobbering WSLENV
-                    if (std::wstring_view{ key } == L"WSLENV")
+                    try
                     {
-                        auto current = environment[L"WSLENV"];
-                        value = current + L":" + value;
-                    }
+                        auto key = item.Key();
+                        // This will throw if the value isn't a string. If that
+                        // happens, then just skip this entry.
+                        auto value = winrt::unbox_value<hstring>(item.Value());
 
-                    environment.insert_or_assign(key.c_str(), value.c_str());
+                        // avoid clobbering WSLENV
+                        if (std::wstring_view{ key } == L"WSLENV")
+                        {
+                            auto current = environment[L"WSLENV"];
+                            value = current + L":" + value;
+                        }
+
+                        environment.insert_or_assign(key.c_str(), value.c_str());
+                    }
+                    CATCH_LOG();
                 }
             }
 
@@ -190,24 +197,82 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
     }
     CATCH_RETURN();
 
-    ConptyConnection::ConptyConnection(const hstring& commandline,
-                                       const hstring& startingDirectory,
-                                       const hstring& startingTitle,
-                                       const Windows::Foundation::Collections::IMapView<hstring, hstring>& environment,
-                                       const uint32_t initialRows,
-                                       const uint32_t initialCols,
-                                       const guid& initialGuid) :
-        _initialRows{ initialRows },
-        _initialCols{ initialCols },
-        _commandline{ commandline },
-        _startingDirectory{ startingDirectory },
-        _startingTitle{ startingTitle },
-        _environment{ environment },
-        _guid{ initialGuid },
+    ConptyConnection::ConptyConnection(const HANDLE hSig,
+                                       const HANDLE hIn,
+                                       const HANDLE hOut,
+                                       const HANDLE hRef,
+                                       const HANDLE hServerProcess,
+                                       const HANDLE hClientProcess) :
+        _initialRows{ 25 },
+        _initialCols{ 80 },
+        _commandline{ L"" },
+        _startingDirectory{ L"" },
+        _startingTitle{ L"" },
+        _environment{ nullptr },
+        _guid{},
         _u8State{},
         _u16Str{},
-        _buffer{}
+        _buffer{},
+        _inPipe{ hIn },
+        _outPipe{ hOut }
     {
+        THROW_IF_FAILED(ConptyPackPseudoConsole(hServerProcess, hRef, hSig, &_hPC));
+        if (_guid == guid{})
+        {
+            _guid = Utils::CreateGuid();
+        }
+
+        _piClient.hProcess = hClientProcess;
+    }
+
+    // Function Description:
+    // - Helper function for constructing a ValueSet that we can use to get our settings from.
+    Windows::Foundation::Collections::ValueSet ConptyConnection::CreateSettings(const winrt::hstring& cmdline,
+                                                                                const winrt::hstring& startingDirectory,
+                                                                                const winrt::hstring& startingTitle,
+                                                                                Windows::Foundation::Collections::IMapView<hstring, hstring> const& environment,
+                                                                                uint32_t rows,
+                                                                                uint32_t columns,
+                                                                                winrt::guid const& guid)
+    {
+        Windows::Foundation::Collections::ValueSet vs{};
+
+        vs.Insert(L"commandline", Windows::Foundation::PropertyValue::CreateString(cmdline));
+        vs.Insert(L"startingDirectory", Windows::Foundation::PropertyValue::CreateString(startingDirectory));
+        vs.Insert(L"startingTitle", Windows::Foundation::PropertyValue::CreateString(startingTitle));
+        vs.Insert(L"initialRows", Windows::Foundation::PropertyValue::CreateUInt32(rows));
+        vs.Insert(L"initialCols", Windows::Foundation::PropertyValue::CreateUInt32(columns));
+        vs.Insert(L"guid", Windows::Foundation::PropertyValue::CreateGuid(guid));
+
+        if (environment)
+        {
+            Windows::Foundation::Collections::ValueSet env{};
+            for (const auto& [k, v] : environment)
+            {
+                env.Insert(k, Windows::Foundation::PropertyValue::CreateString(v));
+            }
+            vs.Insert(L"environment", env);
+        }
+        return vs;
+    }
+
+    void ConptyConnection::Initialize(const Windows::Foundation::Collections::ValueSet& settings)
+    {
+        if (settings)
+        {
+            // For the record, the following won't crash:
+            // auto bad = unbox_value_or<hstring>(settings.TryLookup(L"foo").try_as<IPropertyValue>(), nullptr);
+            // It'll just return null
+
+            _commandline = winrt::unbox_value_or<winrt::hstring>(settings.TryLookup(L"commandline").try_as<Windows::Foundation::IPropertyValue>(), _commandline);
+            _startingDirectory = winrt::unbox_value_or<winrt::hstring>(settings.TryLookup(L"startingDirectory").try_as<Windows::Foundation::IPropertyValue>(), _startingDirectory);
+            _startingTitle = winrt::unbox_value_or<winrt::hstring>(settings.TryLookup(L"startingTitle").try_as<Windows::Foundation::IPropertyValue>(), _startingTitle);
+            _initialRows = winrt::unbox_value_or<uint32_t>(settings.TryLookup(L"initialRows").try_as<Windows::Foundation::IPropertyValue>(), _initialRows);
+            _initialCols = winrt::unbox_value_or<uint32_t>(settings.TryLookup(L"initialCols").try_as<Windows::Foundation::IPropertyValue>(), _initialCols);
+            _guid = winrt::unbox_value_or<winrt::guid>(settings.TryLookup(L"guid").try_as<Windows::Foundation::IPropertyValue>(), _guid);
+            _environment = settings.TryLookup(L"environment").try_as<Windows::Foundation::Collections::ValueSet>();
+        }
+
         if (_guid == guid{})
         {
             _guid = Utils::CreateGuid();
@@ -222,9 +287,14 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
     void ConptyConnection::Start()
     try
     {
-        const COORD dimensions{ gsl::narrow_cast<SHORT>(_initialCols), gsl::narrow_cast<SHORT>(_initialRows) };
-        THROW_IF_FAILED(_CreatePseudoConsoleAndPipes(dimensions, PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE, &_inPipe, &_outPipe, &_hPC));
-        THROW_IF_FAILED(_LaunchAttachedClient());
+        _transitionToState(ConnectionState::Connecting);
+
+        if (!_inPipe)
+        {
+            const COORD dimensions{ gsl::narrow_cast<SHORT>(_initialCols), gsl::narrow_cast<SHORT>(_initialRows) };
+            THROW_IF_FAILED(_CreatePseudoConsoleAndPipes(dimensions, PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE, &_inPipe, &_outPipe, &_hPC));
+            THROW_IF_FAILED(_LaunchAttachedClient());
+        }
 
         _startTime = std::chrono::high_resolution_clock::now();
 
@@ -248,6 +318,8 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
 
         THROW_LAST_ERROR_IF_NULL(_hOutputThread);
 
+        LOG_IF_FAILED(SetThreadDescription(_hOutputThread.get(), L"ConptyConnection Output Thread"));
+
         _clientExitWait.reset(CreateThreadpoolWait(
             [](PTP_CALLBACK_INSTANCE /*callbackInstance*/, PVOID context, PTP_WAIT /*wait*/, TP_WAIT_RESULT /*waitResult*/) noexcept {
                 ConptyConnection* const pInstance = static_cast<ConptyConnection*>(context);
@@ -268,8 +340,20 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
         // EXIT POINT
         const auto hr = wil::ResultFromCaughtException();
 
-        winrt::hstring failureText{ fmt::format(std::wstring_view{ RS_(L"ProcessFailedToLaunch") }, gsl::narrow_cast<unsigned long>(hr), _commandline) };
+        winrt::hstring failureText{ fmt::format(std::wstring_view{ RS_(L"ProcessFailedToLaunch") },
+                                                gsl::narrow_cast<unsigned long>(hr),
+                                                _commandline) };
         _TerminalOutputHandlers(failureText);
+
+        // If the path was invalid, let's present an informative message to the user
+        if (hr == HRESULT_FROM_WIN32(ERROR_DIRECTORY))
+        {
+            winrt::hstring badPathText{ fmt::format(std::wstring_view{ RS_(L"BadPathText") },
+                                                    _startingDirectory) };
+            _TerminalOutputHandlers(L"\r\n");
+            _TerminalOutputHandlers(badPathText);
+        }
+
         _transitionToState(ConnectionState::Failed);
 
         // Tear down any state we may have accumulated.
@@ -449,6 +533,31 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
         }
 
         return 0;
+    }
+
+    static winrt::event<NewConnectionHandler> _newConnectionHandlers;
+
+    winrt::event_token ConptyConnection::NewConnection(NewConnectionHandler const& handler) { return _newConnectionHandlers.add(handler); };
+    void ConptyConnection::NewConnection(winrt::event_token const& token) { _newConnectionHandlers.remove(token); };
+
+    HRESULT ConptyConnection::NewHandoff(HANDLE in, HANDLE out, HANDLE signal, HANDLE ref, HANDLE server, HANDLE client) noexcept
+    try
+    {
+        auto conn = winrt::make<implementation::ConptyConnection>(signal, in, out, ref, server, client);
+        _newConnectionHandlers(conn);
+
+        return S_OK;
+    }
+    CATCH_RETURN()
+
+    void ConptyConnection::StartInboundListener()
+    {
+        THROW_IF_FAILED(CTerminalHandoff::s_StartListening(&ConptyConnection::NewHandoff));
+    }
+
+    void ConptyConnection::StopInboundListener()
+    {
+        THROW_IF_FAILED(CTerminalHandoff::s_StopListening());
     }
 
     // Function Description:
